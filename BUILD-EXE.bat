@@ -1,9 +1,9 @@
 @echo off
-title InvoBiz25 Build Tool
+title InvoBiz Build Tool
 color 0A
 echo.
 echo ============================================
-echo   InvoBiz25 v1.0 - Build EXE
+echo   InvoBiz v1.0 - Build EXE
 echo ============================================
 echo.
 
@@ -31,9 +31,9 @@ echo Done.
 echo.
 echo [2/4] Generating icon...
 python generate_icon.py
-if exist invobiz25.ico (
+if exist invobiz.ico (
     echo Icon ready.
-    set ICON_FLAG=--icon=invobiz25.ico
+    set ICON_FLAG=--icon=invobiz.ico
 ) else (
     set ICON_FLAG=
 )
@@ -42,16 +42,17 @@ echo.
 echo [3/4] Cleaning old build...
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
-if exist InvoBiz25.spec del /q InvoBiz25.spec
-if exist InvoBiz25.exe del /q InvoBiz25.exe
+if exist InvoBiz.spec del /q InvoBiz.spec
+if exist InvoBiz.exe del /q InvoBiz.exe
 echo Done.
 
 echo.
-echo [4/4] Building InvoBiz25.exe - please wait...
+echo [4/4] Building InvoBiz.exe - please wait...
 echo.
 
-python -m PyInstaller --onefile --windowed --name InvoBiz25 %ICON_FLAG% ^
+python -m PyInstaller --onefile --windowed --name InvoBiz %ICON_FLAG% ^
   --add-data "%CTK_PATH%;customtkinter" ^
+  --add-data "invobiz.ico;." ^
   --collect-all customtkinter ^
   --hidden-import customtkinter ^
   --hidden-import reportlab ^
@@ -76,13 +77,13 @@ python -m PyInstaller --onefile --windowed --name InvoBiz25 %ICON_FLAG% ^
   main.py
 
 echo.
-if exist dist\InvoBiz25.exe (
-    copy /y dist\InvoBiz25.exe InvoBiz25.exe >nul
+if exist dist\InvoBiz.exe (
+    copy /y dist\InvoBiz.exe InvoBiz.exe >nul
     echo ============================================
-    echo   SUCCESS! InvoBiz25.exe is ready.
+    echo   SUCCESS! InvoBiz.exe is ready.
     echo ============================================
     echo.
-    echo Share with testers: InvoBiz25.exe + README.txt
+    echo Share with testers: InvoBiz.exe + README.txt
     ie4uinit.exe -show >nul 2>nul
 ) else (
     echo ============================================
