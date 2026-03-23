@@ -1,3 +1,12 @@
+# ============================================================
+# InvoBiz — Invoicing and Business Management made Easy
+# Copyright (c) 2026 Anna Elusini — 25ABCs. All rights reserved.
+#
+# This software is proprietary and confidential.
+# Unauthorized copying, distribution, or modification
+# of this file, via any medium, is strictly prohibited.
+# ============================================================
+
 import customtkinter as ctk
 import sqlite3, json, os, sys
 from datetime import datetime, timedelta
@@ -97,10 +106,41 @@ def init_db():
         'ALTER TABLE clients ADD COLUMN ship_city TEXT',
         'ALTER TABLE clients ADD COLUMN ship_province TEXT',
         'ALTER TABLE clients ADD COLUMN ship_postal TEXT',
+        'ALTER TABLE clients ADD COLUMN pipeline_stage TEXT DEFAULT "cold_lead"',
+        'ALTER TABLE clients ADD COLUMN sample_sent INTEGER DEFAULT 0',
+        '''CREATE TABLE IF NOT EXISTS fulfilment (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_id INTEGER,
+            client_id INTEGER,
+            carrier TEXT DEFAULT "Canada Post",
+            tracking_number TEXT,
+            stage TEXT DEFAULT "ordered",
+            ordered_at TEXT,
+            packed_at TEXT,
+            shipped_at TEXT,
+            delivered_at TEXT,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''',
+        '''CREATE TABLE IF NOT EXISTS carriers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            tracking_url TEXT NOT NULL
+        )''',
     ]
     for m in migrations:
         try: conn.execute(m)
         except: pass
+    # Seed default carriers if table is empty
+    if not conn.execute('SELECT 1 FROM carriers LIMIT 1').fetchone():
+        default_carriers = [
+            ('Canada Post',  'https://www.canadapost-postescanada.ca/track-reperage/en#/search?searchFor={tracking}'),
+            ('UPS',          'https://www.ups.com/track?tracknum={tracking}'),
+            ('FedEx',        'https://www.fedex.com/fedextrack/?tracknumbers={tracking}'),
+            ('Purolator',    'https://www.purolator.com/en/shipping/tracker?pins={tracking}'),
+            ('DHL',          'https://www.dhl.com/en/express/tracking.html?AWB={tracking}'),
+        ]
+        conn.executemany('INSERT OR IGNORE INTO carriers (name, tracking_url) VALUES (?,?)', default_carriers)
     conn.commit()
     conn.close()
 
@@ -117,7 +157,11 @@ def next_invoice_number():
         return f"INV-{year}-{str(last+1).zfill(3)}"
     return f"INV-{year}-001"
 
-def get_settings():
+_settings_cache = [None, 0.0]
+def get_settings(force=False):
+    import time as _t
+    if not force and _settings_cache[0] is not None and (_t.time()-_settings_cache[1]) < 2.0:
+        return _settings_cache[0]
     conn = get_db()
     rows = conn.execute('SELECT key, value FROM settings').fetchall()
     conn.close()
@@ -138,6 +182,8 @@ def get_settings():
     }
     for row in rows:
         defaults[row['key']] = row['value']
+    _settings_cache[0] = defaults
+    _settings_cache[1] = _t.time()
     return defaults
 
 def save_setting(key, value):
@@ -145,6 +191,7 @@ def save_setting(key, value):
     conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)', (key, value))
     conn.commit()
     conn.close()
+    _settings_cache[0] = None
 
 def is_first_run():
     conn = get_db()
@@ -161,6 +208,87 @@ def fmt_date(s):
         d = datetime.strptime(s, '%Y-%m-%d')
         return d.strftime('%b %d, %Y')
     except: return s
+
+
+# ── PIPELINE ──────────────────────────────────────────────────────────────────
+PIPELINE_STAGES = [
+    ("cold_lead",   "Cold Lead",   "#6b7280", "#f3f4f6"),
+    ("contacted",   "Contacted",   "#1d4ed8", "#dbeafe"),
+    ("discovery",   "Discovery",   "#6d28d9", "#ede9fe"),
+    ("onboarded",   "Onboarded",   "#166534", "#dcfce7"),
+]
+STAGE_KEYS   = [s[0] for s in PIPELINE_STAGES]
+STAGE_LABELS = {s[0]: s[1] for s in PIPELINE_STAGES}
+STAGE_COLORS = {s[0]: (s[2], s[3]) for s in PIPELINE_STAGES}
+
+def get_all_pipeline_stages():
+    """One query fetches ALL client stages — use for any bulk rendering."""
+    conn = get_db()
+    clients = conn.execute("SELECT id, pipeline_stage FROM clients").fetchall()
+    invoiced = set(
+        r[0] for r in conn.execute(
+            "SELECT DISTINCT client_id FROM invoices WHERE client_id IS NOT NULL"
+        ).fetchall()
+    )
+    conn.close()
+    result = {}
+    upgrades = []
+    for row in clients:
+        cid = row["id"]
+        stage = row["pipeline_stage"] or "cold_lead"
+        if cid in invoiced and stage in ("cold_lead","contacted","discovery"):
+            stage = "onboarded"
+            upgrades.append(cid)
+        result[cid] = stage
+    if upgrades:
+        conn2 = get_db()
+        conn2.executemany("UPDATE clients SET pipeline_stage='onboarded' WHERE id=?",
+                          [(i,) for i in upgrades])
+        conn2.commit(); conn2.close()
+    return result
+
+def get_client_pipeline_stage(client_id):
+    conn = get_db()
+    c = conn.execute('SELECT pipeline_stage, sample_sent FROM clients WHERE id=?', (client_id,)).fetchone()
+    has_inv = conn.execute('SELECT 1 FROM invoices WHERE client_id=? LIMIT 1', (client_id,)).fetchone()
+    conn.close()
+    stage = (c['pipeline_stage'] if c else None) or 'cold_lead'
+    if has_inv and stage in ('cold_lead', 'contacted', 'discovery'):
+        conn2 = get_db()
+        conn2.execute('UPDATE clients SET pipeline_stage="onboarded" WHERE id=?', (client_id,))
+        conn2.commit(); conn2.close()
+        return 'onboarded'
+    return stage
+
+def set_client_pipeline_stage(client_id, stage):
+    conn = get_db()
+    conn.execute('UPDATE clients SET pipeline_stage=? WHERE id=?', (stage, client_id))
+    conn.commit(); conn.close()
+
+def is_local_client(client_city):
+    if not client_city: return False
+    s = get_settings()
+    user_city = (s.get('biz_city', '') or '').split(',')[0].strip().lower()
+    client_city_clean = client_city.strip().lower()
+    if not user_city: return False
+    if user_city == client_city_clean: return True
+    DISTANCES = {
+        frozenset(['vancouver', 'burnaby']): 15,
+        frozenset(['vancouver', 'surrey']): 30,
+        frozenset(['vancouver', 'richmond']): 20,
+        frozenset(['vancouver', 'coquitlam']): 25,
+        frozenset(['vancouver', 'langley']): 50,
+        frozenset(['vancouver', 'abbotsford']): 80,
+        frozenset(['vancouver', 'victoria']): 110,
+        frozenset(['toronto', 'mississauga']): 30,
+        frozenset(['toronto', 'brampton']): 40,
+        frozenset(['toronto', 'hamilton']): 70,
+        frozenset(['calgary', 'edmonton']): 300,
+    }
+    key = frozenset([user_city, client_city_clean])
+    dist = DISTANCES.get(key)
+    if dist is not None: return dist <= 150
+    return False
 
 # ── PDF GENERATOR ──────────────────────────────────────────────────────────
 def generate_pdf(inv_id, save_path, ship_to_override=None):
@@ -209,15 +337,21 @@ def generate_pdf(inv_id, save_path, ship_to_override=None):
             logo_img = RLImage(logo_path, width=1.4*inch, height=0.7*inch, kind='proportional')
             left_cell = logo_img
         except Exception:
-            left_cell = Paragraph(f'<font size="22" color="#E63B2E"><b>{biz_name}</b></font>', styles['Normal'])
+            left_cell = Paragraph(f'<font size="22" color="#E63B2E"><b>{biz_name}</b></font>',
+                                  ParagraphStyle("logo", parent=styles["Normal"], spaceBefore=6, spaceAfter=6))
     else:
-        left_cell = Paragraph(f'<font size="22" color="#E63B2E"><b>{biz_name}</b></font>', styles['Normal'])
+        left_cell = Paragraph(f'<font size="22" color="#E63B2E"><b>{biz_name}</b></font>',
+                              ParagraphStyle("logo", parent=styles["Normal"], spaceBefore=6, spaceAfter=6))
 
     right_cell = Paragraph('<font size="30" color="#1a1a2e"><b>INVOICE</b></font>', R)
     ht = Table([[left_cell, right_cell]], colWidths=[3.6*inch, 3.6*inch])
-    ht.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'MIDDLE')]))
+    ht.setStyle(TableStyle([
+        ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+        ('BOTTOMPADDING',(0,0),(-1,-1),10),
+        ('TOPPADDING',(0,0),(-1,-1),6),
+    ]))
     story.append(ht)
-    story.append(HRFlowable(width="100%", thickness=2, color=brand_red, spaceAfter=8))
+    story.append(HRFlowable(width="52%", thickness=2, color=brand_red, spaceBefore=0, spaceAfter=8, hAlign="LEFT"))
 
     # ── SUB-HEADER: biz info left | invoice meta right ────────────────────
     # Single-line address (no country)
@@ -400,14 +534,14 @@ def scrollframe(parent, **kw):
 class SplashScreen(tk.Toplevel):
     """
     Branded loading screen shown while the main App window builds.
-    Appears instantly, animates a progress bar, then destroys itself.
+    Uses a canvas for rock-solid rendering — no partial-load flicker.
     """
-    WIDTH  = 420
-    HEIGHT = 260
+    WIDTH  = 440
+    HEIGHT = 270
 
     def __init__(self, master):
         super().__init__(master)
-        self.overrideredirect(True)   # no title bar / borders
+        self.overrideredirect(True)
         self.configure(bg="#1a1a2e")
         self.attributes("-topmost", True)
         self.resizable(False, False)
@@ -420,59 +554,86 @@ class SplashScreen(tk.Toplevel):
         self.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
 
         self._build()
+        # Force full render before anything else happens
         self.update()
+        self.lift()
 
     def _build(self):
-        # ── Logo box ──────────────────────────────────────────────────────
-        logo_frame = tk.Frame(self, bg="#1a1a2e")
-        logo_frame.pack(pady=(38, 0))
+        BG = "#1a1a2e"
+        W, H = self.WIDTH, self.HEIGHT
+        cx = W // 2
+        c = tk.Canvas(self, width=W, height=H, bg=BG, highlightthickness=0)
+        c.pack(fill="both", expand=True)
+        self._canvas = c
 
-        tk.Label(logo_frame, text="Invi", font=("Segoe UI", 32, "bold"),
-                 fg="#ffffff", bg="#1a1a2e").pack(side="left")
-        tk.Label(logo_frame, text="Biz", font=("Segoe UI", 32, "bold"),
-                 fg="#3b82f6", bg="#1a1a2e").pack(side="left")
-        tk.Label(logo_frame, text="25",  font=("Segoe UI", 32, "bold"),
-                 fg="#16A34A", bg="#1a1a2e").pack(side="left")
+        # ── Logo — draw Invo (white) and Biz (blue) side by side ──────────
+        # Use anchor="e" and anchor="w" from the centre so they always
+        # butt up perfectly regardless of font rendering
+        FONT_LOGO = ("Segoe UI", 32, "bold")
+        c.create_text(cx - 2, 80, text="Invo",
+                      font=FONT_LOGO, fill="#ffffff", anchor="e")
+        c.create_text(cx + 2, 80, text="Biz",
+                      font=FONT_LOGO, fill="#3b82f6", anchor="w")
 
         # ── Tagline ───────────────────────────────────────────────────────
-        tk.Label(self, text="Chaos managed. Business organized.",
-                 font=("Segoe UI", 10), fg="#6b7280", bg="#1a1a2e").pack(pady=(6, 0))
+        c.create_text(cx, 118,
+                      text="Chaos managed. Business organized.",
+                      font=("Segoe UI", 10), fill="#6b7280", anchor="center")
+
+        # ── Divider line ──────────────────────────────────────────────────
+        c.create_line(cx-120, 138, cx+120, 138, fill="#2d2d4e", width=1)
 
         # ── Progress bar track ────────────────────────────────────────────
-        bar_frame = tk.Frame(self, bg="#1a1a2e")
-        bar_frame.pack(pady=(28, 0))
+        bx1, by1, bx2, by2 = cx-140, 158, cx+140, 164
+        c.create_rectangle(bx1, by1, bx2, by2, fill="#2d2d4e", outline="")
+        self._bar_rect = c.create_rectangle(bx1, by1, bx1, by2,
+                                             fill="#3b82f6", outline="")
+        self._bar_x1 = bx1
+        self._bar_x2 = bx2
 
-        track = tk.Frame(bar_frame, width=280, height=5,
-                         bg="#2d2d4e", relief="flat")
-        track.pack()
-        track.pack_propagate(False)
-
-        self._fill = tk.Frame(track, width=0, height=5,
-                              bg="#3b82f6", relief="flat")
-        self._fill.place(x=0, y=0, height=5)
-
-        # ── Status text ───────────────────────────────────────────────────
-        self._status_var = tk.StringVar(value="Starting up...")
-        tk.Label(self, textvariable=self._status_var,
-                 font=("Segoe UI", 9), fg="#6b7280", bg="#1a1a2e").pack(pady=(8, 0))
+        # ── Status label ──────────────────────────────────────────────────
+        self._status_id = c.create_text(cx, 180, text="Starting up...",
+                                         font=("Segoe UI", 9), fill="#6b7280",
+                                         anchor="center")
 
         # ── Version ───────────────────────────────────────────────────────
-        tk.Label(self, text="v1.0",
-                 font=("Segoe UI", 8), fg="#374151", bg="#1a1a2e").pack(side="bottom", pady=12)
+        c.create_text(cx, H - 16, text="v1.0 Beta",
+                      font=("Segoe UI", 8), fill="#374151", anchor="center")
 
         self._progress = 0
 
     def set_progress(self, pct: int, status: str = ""):
-        """Update the progress bar (0-100) and optional status label."""
+        """Update the progress bar and status text."""
         self._progress = pct
-        bar_width = int(280 * pct / 100)
-        self._fill.place(x=0, y=0, width=bar_width, height=5)
+        bar_width = int((self._bar_x2 - self._bar_x1) * pct / 100)
+        self._canvas.coords(self._bar_rect,
+                            self._bar_x1, 162,
+                            self._bar_x1 + bar_width, 168)
         if status:
-            self._status_var.set(status)
+            self._canvas.itemconfig(self._status_id, text=status)
         self.update()
 
 # ── MAIN APPLICATION ───────────────────────────────────────────────────────
 class App(ctk.CTk):
+    def _set_icon(self, window):
+        """Apply the InvoBiz icon to any toplevel window."""
+        try:
+            import sys, os
+            base = sys._MEIPASS if getattr(sys,"frozen",False) else os.path.dirname(os.path.abspath(__file__))
+            ico = os.path.join(base, "invobiz.ico")
+            if os.path.exists(ico):
+                window.after(100, lambda: window.iconbitmap(ico))
+        except: pass
+
+    def _debounce(self, fn, delay=220):
+        _pending = [None]
+        def wrapper(*args, **kwargs):
+            if _pending[0] is not None:
+                try: self.after_cancel(_pending[0])
+                except: pass
+            _pending[0] = self.after(delay, lambda: fn())
+        return wrapper
+
     def __init__(self):
         super().__init__()
         self.withdraw()   # hide main window while splash is showing
@@ -482,7 +643,15 @@ class App(ctk.CTk):
         splash.set_progress(5,  "Initialising...")
 
         # ── Setup main window ─────────────────────────────────────────────
-        self.title("InvoBiz25")
+        self.title("InvoBiz")
+        # Set taskbar + title bar icon
+        try:
+            import sys, os
+            _base = sys._MEIPASS if getattr(sys,"frozen",False) else os.path.dirname(os.path.abspath(__file__))
+            _ico = os.path.join(_base, "invobiz.ico")
+            if os.path.exists(_ico):
+                self.iconbitmap(_ico)
+        except: pass
         self.geometry("1200x750")
         self.minsize(900, 600)
         self.configure(fg_color=LIGHT)
@@ -500,18 +669,20 @@ class App(ctk.CTk):
         self._build_ui()
 
         splash.set_progress(85, "Loading your data...")
+        get_all_pipeline_stages()  # warm pipeline cache
         if is_first_run():
             splash.set_progress(100, "Ready!")
-            self.after(400, splash.destroy)
-            self.after(420, self.deiconify)
-            self.after(450, lambda: self.show_page("settings"))
-            self.after(500, lambda: messagebox.showinfo("Welcome to InvoBiz25! 🎉",
-                "Thanks for trying InvoBiz25 v1.0!\n\nTo get started, fill in your business\ndetails in Settings — your name, address,\nand email will appear on every invoice.\n\nHappy invoicing!"))
+            self.after(350, self.deiconify)          # show main window first
+            self.after(380, splash.destroy)           # then remove splash — no gap
+            self.after(400, lambda: self.show_page("settings"))
+            self.after(450, lambda: messagebox.showinfo("Welcome to InvoBiz! 🎉",
+                "Thanks for trying InvoBiz v1.0 Beta!\n\nTo get started, fill in your business\ndetails in Settings — your name, address,\nand email will appear on every invoice.\n\nHappy invoicing!"))
         else:
             splash.set_progress(100, "Ready!")
-            self.after(400, splash.destroy)
-            self.after(420, self.deiconify)
-            self.after(450, lambda: self.show_page("dashboard"))
+            self.after(350, self.deiconify)          # show main window first
+            self.after(380, splash.destroy)           # then remove splash — no gap
+            self.after(400, lambda: self.show_page("dashboard"))
+            self.after(900, self._prerender_pipeline)  # pre-render pipeline in background
 
     def _build_ui(self):
         # Sidebar
@@ -522,9 +693,8 @@ class App(ctk.CTk):
         # Logo — centered, white / blue / green
         logo_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         logo_frame.pack(pady=(20,4))
-        ctk.CTkLabel(logo_frame, text="Invi", font=ctk.CTkFont(size=24, weight="bold"), text_color=WHITE).pack(side="left")
+        ctk.CTkLabel(logo_frame, text="Invo", font=ctk.CTkFont(size=24, weight="bold"), text_color=WHITE).pack(side="left")
         ctk.CTkLabel(logo_frame, text="Biz",  font=ctk.CTkFont(size=24, weight="bold"), text_color="#3b82f6").pack(side="left")
-        ctk.CTkLabel(logo_frame, text="25",   font=ctk.CTkFont(size=24, weight="bold"), text_color=GREEN).pack(side="left")
 
         ctk.CTkLabel(self.sidebar, text="Chaos managed.\nBusiness organized.",
                      font=ctk.CTkFont(size=10), text_color="gray60",
@@ -532,7 +702,7 @@ class App(ctk.CTk):
         separator(self.sidebar).pack(fill="x", padx=16, pady=(0,16))
 
         self.nav_btns = {}
-        nav_items = [("🏠  Dashboard","dashboard"),("📄  Invoices","invoices"),("👥  Clients & CRM","clients"),("⚙️  Settings","settings")]
+        nav_items = [("🏠  Dashboard","dashboard"),("📄  Invoices","invoices"),("👥  Clients & CRM","clients"),("📦  Fulfilment","fulfilment"),("⚙️  Settings","settings")]
         for label_text, page in nav_items:
             b = ctk.CTkButton(self.sidebar, text=label_text, command=lambda p=page: self.show_page(p),
                               fg_color="transparent", hover_color="#2d2d44",
@@ -542,21 +712,25 @@ class App(ctk.CTk):
             self.nav_btns[page] = b
 
         # Version at bottom
-        ctk.CTkLabel(self.sidebar, text="v1.0 — InvoBiz25", font=ctk.CTkFont(size=10),
-                     text_color="gray50").pack(side="bottom", pady=16)
+        ctk.CTkLabel(self.sidebar, text="v1.0 Beta — InvoBiz", font=ctk.CTkFont(size=10),
+                     text_color="gray50").pack(side="bottom", pady=(0,4))
+        ctk.CTkLabel(self.sidebar, text="© 2026 Anna Elusini — 25ABCs. All rights reserved.",
+                     font=ctk.CTkFont(size=9), text_color="gray40",
+                     wraplength=180, justify="center").pack(side="bottom", pady=(0,4))
 
         # Main content area
         self.content = ctk.CTkFrame(self, fg_color=LIGHT, corner_radius=0)
         self.content.pack(side="left", fill="both", expand=True)
 
         self.pages = {}
-        for page in ["dashboard","invoices","clients","settings"]:
+        for page in ["dashboard","invoices","clients","fulfilment","settings"]:
             frame = ctk.CTkFrame(self.content, fg_color=LIGHT, corner_radius=0)
             self.pages[page] = frame
 
         self._build_dashboard()
         self._build_invoices()
         self._build_clients()
+        self._build_fulfilment()
         self._build_settings()
 
     def show_page(self, page):
@@ -568,6 +742,7 @@ class App(ctk.CTk):
         if page == "dashboard": self.refresh_dashboard()
         elif page == "invoices": self.refresh_invoices()
         elif page == "clients": self.refresh_clients()
+        elif page == "fulfilment": self.refresh_fulfilment()
         elif page == "settings": self.refresh_settings()
 
     # ── DASHBOARD ────────────────────────────────────────────────────────
@@ -597,7 +772,7 @@ class App(ctk.CTk):
         label(lh, "Recent Invoices", size=14, weight="bold").pack(side="left")
         self.dash_inv_search = entry(lh, "Search invoice #...", width=160)
         self.dash_inv_search.pack(side="right")
-        self.dash_inv_search.bind("<KeyRelease>", lambda e: self._refresh_dash_invoices())
+        self.dash_inv_search.bind("<KeyRelease>", self._debounce(lambda *_: self._refresh_dash_invoices()))
         self.dash_inv_frame = scrollframe(left)
         self.dash_inv_frame.pack(fill="both", expand=True, padx=8, pady=(0,8))
 
@@ -835,7 +1010,7 @@ class App(ctk.CTk):
         bar.pack(fill="x", padx=24, pady=(0,12))
         self.inv_search = entry(bar, "Search invoices...", width=260)
         self.inv_search.pack(side="left")
-        self.inv_search.bind("<KeyRelease>", lambda e: self.refresh_invoices())
+        self.inv_search.bind("<KeyRelease>", self._debounce(lambda *_: self.refresh_invoices()))
         self.inv_status_filter = ctk.CTkComboBox(bar, values=["All","unpaid","paid","overdue"], width=110,
                                                   fg_color=WHITE, border_color=BORDER, text_color=DARK,
                                                   command=lambda _: self.refresh_invoices())
@@ -1079,6 +1254,7 @@ class App(ctk.CTk):
     def open_invoice_dialog(self, inv_id=None):
         dlg = ctk.CTkToplevel(self)
         dlg.title("Edit Invoice" if inv_id else "New Invoice")
+        self._set_icon(dlg)
         dlg.geometry("750x700")
         dlg.grab_set()
         dlg.configure(fg_color=WHITE)
@@ -1349,23 +1525,56 @@ class App(ctk.CTk):
         bar.pack(fill="x", padx=24, pady=(0,12))
         self.client_search = entry(bar, "Search by name, company, phone, city...", width=380)
         self.client_search.pack(side="left")
-        self.client_search.bind("<KeyRelease>", lambda e: self.refresh_clients())
+        self.client_search.bind("<KeyRelease>", self._debounce(lambda *_: self.refresh_clients()))
         self.client_filter = ctk.CTkComboBox(bar, values=["All","Starred","Has Follow-up"], width=140,
                                               fg_color=WHITE, border_color=BORDER, text_color=DARK,
                                               command=lambda _: self.refresh_clients())
         self.client_filter.set("All")
         self.client_filter.pack(side="left", padx=8)
-        label(bar, "🔍 Search by name, company, phone or city", size=11, color=GRAY).pack(side="left", padx=8)
+        _stage_opts = ["All Stages"] + [s[1] for s in PIPELINE_STAGES]
+        self.pipeline_filter = ctk.CTkComboBox(bar, values=_stage_opts, width=130,
+                                               fg_color=WHITE, border_color=BORDER, text_color=DARK,
+                                               command=lambda _: self.refresh_clients())
+        self.pipeline_filter.set("All Stages")
+        self.pipeline_filter.pack(side="left", padx=(0,8))
+        btn(bar, "📊 Pipeline", self._show_pipeline_view, color="#374151", width=100).pack(side="left")
+        btn(bar, "🗺 By Territory", self._show_territory_view, color="#374151", width=110).pack(side="left", padx=(6,0))
 
         self.clients_list = scrollframe(pane)
         self.clients_list.pack(fill="both", expand=True, padx=24, pady=(0,16))
 
+    def _get_filtered_client_ids(self):
+        """Return ordered list of client IDs matching current search/filter — for CRM nav."""
+        q  = self.client_search.get().lower() if hasattr(self, "client_search") else ""
+        f  = self.client_filter.get() if hasattr(self, "client_filter") else "All"
+        pf = self.pipeline_filter.get() if hasattr(self, "pipeline_filter") else "All Stages"
+        conn = get_db()
+        clients = [dict(c) for c in conn.execute("SELECT * FROM clients ORDER BY starred DESC, company, name").fetchall()]
+        conn.close()
+        _sm = get_all_pipeline_stages()
+        ids = []
+        for c in clients:
+            name = c.get("company") or c.get("name", "")
+            searchable = " ".join(filter(None, [
+                c.get("name",""), c.get("company",""), c.get("phone",""),
+                c.get("city",""), c.get("email",""), c.get("province","")
+            ])).lower()
+            if q and q not in searchable: continue
+            if f == "Starred" and not c.get("starred"): continue
+            if f == "Has Follow-up" and not c.get("follow_up_date"): continue
+            stage = _sm.get(c["id"], "cold_lead")
+            if pf != "All Stages" and STAGE_LABELS.get(stage,"") != pf: continue
+            ids.append(c["id"])
+        return ids
+
     def refresh_clients(self):
-        q = self.client_search.get().lower() if hasattr(self,'client_search') else ""
-        f = self.client_filter.get() if hasattr(self,'client_filter') else "All"
+        q  = self.client_search.get().lower() if hasattr(self,'client_search') else ""
+        f  = self.client_filter.get() if hasattr(self,'client_filter') else "All"
+        pf = self.pipeline_filter.get() if hasattr(self,'pipeline_filter') else "All Stages"
         conn = get_db()
         clients = conn.execute('SELECT * FROM clients ORDER BY starred DESC, name').fetchall()
         conn.close()
+        _stage_map_cache = get_all_pipeline_stages()
         for w in self.clients_list.winfo_children(): w.destroy()
         shown = 0
         for c in clients:
@@ -1378,29 +1587,34 @@ class App(ctk.CTk):
             if q and q not in searchable: continue
             if f == "Starred" and not c.get('starred'): continue
             if f == "Has Follow-up" and not c.get('follow_up_date'): continue
+            stage = _stage_map_cache.get(c['id'], 'cold_lead')
+            if pf != "All Stages" and STAGE_LABELS.get(stage,'') != pf: continue
             shown += 1
             card = ctk.CTkFrame(self.clients_list, fg_color=WHITE, corner_radius=10,
                                border_width=2 if c['starred'] else 1,
                                border_color=AMBER if c['starred'] else BORDER)
             card.pack(fill="x", pady=4)
-
             row_inner = ctk.CTkFrame(card, fg_color="transparent")
             row_inner.pack(fill="x", padx=12, pady=(8,4))
             star = "⭐" if c['starred'] else "☆"
             cid = c['id']
-            # Left block: company name (bold) + contact name beneath
             left_block = ctk.CTkFrame(row_inner, fg_color="transparent")
             left_block.pack(side="left")
             label(left_block, f"{star}  {name}", size=13, weight="bold").pack(anchor="w")
-            # Show individual name below company if they differ
             contact_name = c.get('name','')
             if contact_name and contact_name.lower() != name.lower():
                 label(left_block, f"    👤 {contact_name}", size=11, color=GRAY).pack(anchor="w")
+            # Pipeline stage badge
+            s_text_col, s_bg = STAGE_COLORS.get(stage, ("#6b7280","#f3f4f6"))
+            badge_frame = ctk.CTkFrame(row_inner, fg_color=s_bg, corner_radius=6)
+            badge_frame.pack(side="left", padx=(10,0))
+            ctk.CTkLabel(badge_frame, text=STAGE_LABELS.get(stage,'?'),
+                         font=ctk.CTkFont(size=10, weight="bold"),
+                         text_color=s_text_col).pack(padx=6, pady=2)
             acts = ctk.CTkFrame(row_inner, fg_color="transparent"); acts.pack(side="right")
-            btn(acts, "CRM →", lambda i=cid: self.open_crm_detail(i), color=DARK, width=70).pack(side="left", padx=2)
+            btn(acts, "CRM →", lambda i=cid, nl=None: self.open_crm_detail(i, nav_list=self._get_filtered_client_ids()), color=DARK, width=70).pack(side="left", padx=2)
             btn(acts, "Edit", lambda i=cid: self.open_client_dialog(i), color="#374151", width=50).pack(side="left", padx=2)
             btn(acts, "✕", lambda i=cid: self.delete_client(i), color=RED, width=30).pack(side="left", padx=2)
-            # Contact info row — only rendered if there's something to show
             has_info = c.get('email') or c.get('phone') or c.get('follow_up_date')
             if has_info:
                 info_row = ctk.CTkFrame(card, fg_color="transparent")
@@ -1425,6 +1639,23 @@ class App(ctk.CTk):
                       font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
         self.crm_client_title = label(back_bar, "", size=18, weight="bold")
         self.crm_client_title.pack(side="left", padx=16)
+        # Prev / Next navigation — respects active filter list
+        nav_right = ctk.CTkFrame(back_bar, fg_color="transparent")
+        nav_right.pack(side="right")
+        self._crm_nav_counter = label(nav_right, "", size=11, color=GRAY)
+        self._crm_nav_counter.pack(side="left", padx=(0,8))
+        self._crm_prev_btn = ctk.CTkButton(
+            nav_right, text="‹ Prev", width=80, height=32,
+            fg_color=DARK, hover_color="#2d2d44", text_color=WHITE,
+            corner_radius=8, font=ctk.CTkFont(size=12),
+            command=self._crm_nav_prev)
+        self._crm_prev_btn.pack(side="left", padx=(0,4))
+        self._crm_next_btn = ctk.CTkButton(
+            nav_right, text="Next ›", width=80, height=32,
+            fg_color=DARK, hover_color="#2d2d44", text_color=WHITE,
+            corner_radius=8, font=ctk.CTkFont(size=12),
+            command=self._crm_nav_next)
+        self._crm_next_btn.pack(side="left")
 
         cols = ctk.CTkFrame(pane, fg_color="transparent")
         cols.pack(fill="both", expand=True, padx=24, pady=(0,16))
@@ -1612,8 +1843,17 @@ class App(ctk.CTk):
                             font=ctk.CTkFont(size=13, weight="normal"))
                 self.crm_panels[t].grid_remove()
 
-    def open_crm_detail(self, client_id):
+    def open_crm_detail(self, client_id, nav_list=None):
         self.current_client_id = client_id
+        # Store the navigation list (respects active filter/search)
+        if nav_list is not None:
+            self._crm_nav_list = nav_list
+        elif not hasattr(self, "_crm_nav_list") or not self._crm_nav_list:
+            # Build full list as fallback
+            conn0 = get_db()
+            self._crm_nav_list = [r["id"] for r in
+                conn0.execute("SELECT id FROM clients ORDER BY company, name").fetchall()]
+            conn0.close()
         self.clients_pane.pack_forget()
         self.crm_pane.pack(fill="both", expand=True)
         conn = get_db()
@@ -1622,6 +1862,8 @@ class App(ctk.CTk):
         conn.close()
 
         self.crm_client_title.configure(text=f"{'⭐ ' if c['starred'] else ''}{c['company'] or c['name']}")
+        # Update nav counter and button states
+        self._update_crm_nav_state()
 
         # Client info — locked by default, unlocked on Edit click
         for w in self.crm_info_card.winfo_children(): w.destroy()
@@ -1697,8 +1939,48 @@ class App(ctk.CTk):
 
         edit_toggle_btn.configure(command=lambda: set_edit_mode(not edit_active[0]))
 
+        # Pipeline stage + sample sent row
+        pipe_row = ctk.CTkFrame(self.crm_info_card, fg_color="transparent")
+        pipe_row.pack(fill="x", padx=12, pady=(4,4))
+        label(pipe_row, "Pipeline:", size=11, color=GRAY, width=70, anchor="w").pack(side="left")
+        _cur_stage = get_client_pipeline_stage(client_id)
+        _stage_label_list = [s[1] for s in PIPELINE_STAGES]
+        pipe_combo = ctk.CTkComboBox(pipe_row, values=_stage_label_list, width=140,
+                                     fg_color=WHITE, border_color=BORDER, text_color=DARK,
+                                     font=ctk.CTkFont(size=11))
+        pipe_combo.set(STAGE_LABELS.get(_cur_stage, "Cold Lead"))
+        pipe_combo.pack(side="left", padx=(0,8))
+        sample_var = ctk.IntVar(value=c.get('sample_sent', 0))
+        _is_local = is_local_client(c.get('city',''))
+
+        def _save_sample_and_stage(*_):
+            """Save pipeline stage + sample sent instantly on change."""
+            sel = pipe_combo.get()
+            ns = next((k for k,v in STAGE_LABELS.items() if v == sel), 'cold_lead')
+            conn_s = get_db()
+            conn_s.execute('UPDATE clients SET pipeline_stage=?, sample_sent=? WHERE id=?',
+                           (ns, sample_var.get(), client_id))
+            conn_s.commit(); conn_s.close()
+            self.refresh_clients()
+
+        # Bind pipeline combo to auto-save on change
+        pipe_combo.configure(command=_save_sample_and_stage)
+
+        if _is_local:
+            chk = ctk.CTkCheckBox(pipe_row, text="📦 Sample sent", variable=sample_var,
+                            fg_color=AMBER, hover_color=AMBER, text_color=DARK,
+                            font=ctk.CTkFont(size=11),
+                            command=_save_sample_and_stage)  # save on tick
+            chk.pack(side="left")
+        else:
+            label(pipe_row, "Remote client", size=10, color=GRAY).pack(side="left")
+
         def save_crm_info():
             conn2 = get_db()
+            selected_label = pipe_combo.get()
+            new_stage = next((k for k,v in STAGE_LABELS.items() if v == selected_label), 'cold_lead')
+            conn2.execute('UPDATE clients SET pipeline_stage=?, sample_sent=? WHERE id=?',
+                         (new_stage, sample_var.get(), client_id))
             conn2.execute("""UPDATE clients SET name=?,company=?,phone=?,email=?,city=?,province=?,follow_up_date=? WHERE id=?""",
                 (crm_fields["name"].get().strip(),
                  crm_fields["company"].get().strip() or None,
@@ -1904,10 +2186,281 @@ class App(ctk.CTk):
         btn(btn_row, "OK", confirm, color=RED, width=90).pack(side="left", padx=6)
         btn(btn_row, "Cancel", dlg.destroy, color=GRAY, width=90).pack(side="left", padx=6)
 
+    def _update_crm_nav_state(self):
+        nav = getattr(self, "_crm_nav_list", [])
+        if not nav or not hasattr(self, "_crm_nav_counter"): return
+        try:
+            idx = nav.index(self.current_client_id)
+        except ValueError:
+            idx = -1
+        total = len(nav)
+        if idx >= 0:
+            self._crm_nav_counter.configure(text=f"{idx+1} of {total}")
+        else:
+            self._crm_nav_counter.configure(text="")
+        # Dim buttons at boundaries
+        prev_state = "normal" if idx > 0 else "disabled"
+        next_state = "normal" if 0 <= idx < total - 1 else "disabled"
+        self._crm_prev_btn.configure(state=prev_state,
+            fg_color=DARK if prev_state=="normal" else GRAY)
+        self._crm_next_btn.configure(state=next_state,
+            fg_color=DARK if next_state=="normal" else GRAY)
+
+    def _crm_nav_prev(self):
+        nav = getattr(self, "_crm_nav_list", [])
+        if not nav: return
+        try: idx = nav.index(self.current_client_id)
+        except ValueError: return
+        if idx > 0:
+            self.open_crm_detail(nav[idx - 1], nav_list=nav)
+
+    def _crm_nav_next(self):
+        nav = getattr(self, "_crm_nav_list", [])
+        if not nav: return
+        try: idx = nav.index(self.current_client_id)
+        except ValueError: return
+        if idx < len(nav) - 1:
+            self.open_crm_detail(nav[idx + 1], nav_list=nav)
+
     def show_clients_list(self):
         self.crm_pane.pack_forget()
+        if hasattr(self, 'pipeline_pane'): self.pipeline_pane.pack_forget()
+        if hasattr(self, 'territory_pane'): self.territory_pane.pack_forget()
         self.clients_pane.pack(fill="both", expand=True)
         self.refresh_clients()
+
+    def _show_territory_view(self):
+        self.clients_pane.pack_forget()
+        if not hasattr(self, "territory_pane"):
+            self.territory_pane = ctk.CTkFrame(self.pages["clients"], fg_color="transparent")
+        else:
+            for w in self.territory_pane.winfo_children(): w.destroy()
+        self.territory_pane.pack(fill="both", expand=True)
+
+        hdr = ctk.CTkFrame(self.territory_pane, fg_color="transparent")
+        hdr.pack(fill="x", padx=24, pady=(20,12))
+        label(hdr, "Clients by Territory", size=22, weight="bold").pack(side="left")
+        btn(hdr, "← All Clients", self._back_from_territory, color="#374151", width=130).pack(side="right")
+
+        conn = get_db()
+        clients = [dict(c) for c in conn.execute("SELECT * FROM clients ORDER BY province, company, name").fetchall()]
+        conn.close()
+        _stage_map = get_all_pipeline_stages()
+
+        # Group by province
+        from collections import OrderedDict
+        groups = OrderedDict()
+        for c in clients:
+            prov = (c.get("province") or "").strip() or "Unknown"
+            groups.setdefault(prov, []).append(c)
+
+        scroll = scrollframe(self.territory_pane)
+        scroll.pack(fill="both", expand=True, padx=24, pady=(0,16))
+
+        for prov, group in sorted(groups.items()):
+            # Province header
+            prov_hdr = ctk.CTkFrame(scroll, fg_color=DARK, corner_radius=8)
+            prov_hdr.pack(fill="x", pady=(8,4))
+            prov_inner = ctk.CTkFrame(prov_hdr, fg_color="transparent")
+            prov_inner.pack(fill="x", padx=14, pady=8)
+            label(prov_inner, f"📍  {prov}", size=14, weight="bold", color=WHITE).pack(side="left")
+            label(prov_inner, f"{len(group)} client{"s" if len(group)!=1 else ""}",
+                  size=11, color="gray60").pack(side="right")
+
+            for c in group:
+                cid = c["id"]
+                cname = c.get("company") or c.get("name", "")
+                card = ctk.CTkFrame(scroll, fg_color=WHITE,
+                                   corner_radius=8, border_width=1, border_color=BORDER)
+                card.pack(fill="x", pady=2, padx=8)
+                row = ctk.CTkFrame(card, fg_color="transparent")
+                row.pack(fill="x", padx=12, pady=6)
+                # Name + stage badge
+                left = ctk.CTkFrame(row, fg_color="transparent")
+                left.pack(side="left")
+                label(left, f"{"⭐ " if c["starred"] else ""}{cname}", size=12, weight="bold").pack(anchor="w")
+                if c.get("name") and c["name"].lower() != cname.lower():
+                    label(left, f"👤 {c["name"]}", size=10, color=GRAY).pack(anchor="w")
+                if c.get("city"):
+                    label(left, f"🏙 {c["city"]}", size=10, color=GRAY).pack(anchor="w")
+                # Stage badge
+                stage = _stage_map.get(cid, "cold_lead")
+                s_text_col, s_bg = STAGE_COLORS.get(stage, ("#6b7280","#f3f4f6"))
+                badge = ctk.CTkFrame(row, fg_color=s_bg, corner_radius=6)
+                badge.pack(side="left", padx=(10,0))
+                ctk.CTkLabel(badge, text=STAGE_LABELS.get(stage,"?"),
+                             font=ctk.CTkFont(size=10, weight="bold"),
+                             text_color=s_text_col).pack(padx=6, pady=2)
+                # CRM button
+                group_ids = [cl["id"] for cl in group]
+                btn(row, "CRM →",
+                    lambda i=cid, nl=group_ids: self._open_crm_from_territory(i, nl),
+                    color=DARK, width=70).pack(side="right")
+
+    def _back_from_territory(self):
+        if hasattr(self, "territory_pane"):
+            self.territory_pane.pack_forget()
+        self.clients_pane.pack(fill="both", expand=True)
+        self.refresh_clients()
+
+    def _open_crm_from_territory(self, client_id, nav_list):
+        if hasattr(self, "territory_pane"):
+            self.territory_pane.pack_forget()
+        self.open_crm_detail(client_id, nav_list=nav_list)
+
+    def _prerender_pipeline(self):
+        """Silently pre-render the pipeline in the background after app loads.
+        So first click feels instant instead of building from scratch."""
+        try:
+            if not hasattr(self, "pipeline_pane"):
+                self.pipeline_pane = ctk.CTkFrame(self.pages["clients"], fg_color="transparent")
+            # Build it hidden — don't pack it
+            self._pipeline_prerendered = False
+            # Just warm the data — actual render happens on first click
+            get_all_pipeline_stages()
+        except: pass
+
+    def _show_pipeline_view(self):
+        self.clients_pane.pack_forget()
+        if not hasattr(self, 'pipeline_pane'):
+            self.pipeline_pane = ctk.CTkFrame(self.pages["clients"], fg_color="transparent")
+        else:
+            for w in self.pipeline_pane.winfo_children(): w.destroy()
+        self.pipeline_pane.pack(fill="both", expand=True)
+
+        # ── Header ────────────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(self.pipeline_pane, fg_color="transparent")
+        hdr.pack(fill="x", padx=24, pady=(20,12))
+        label(hdr, "Sales Pipeline", size=22, weight="bold").pack(side="left")
+        btn(hdr, "← All Clients", self.show_clients_list, color="#374151", width=120).pack(side="right")
+
+        # ── Batch-load all data BEFORE touching the UI ────────────────────
+        conn = get_db()
+        all_clients = [dict(c) for c in conn.execute('SELECT * FROM clients ORDER BY name').fetchall()]
+        conn.close()
+        _sm = get_all_pipeline_stages()
+        from collections import defaultdict as _dd
+        stage_groups = _dd(list)
+        for _pc in all_clients:
+            stage_groups[_sm.get(_pc['id'], 'cold_lead')].append(_pc)
+
+        # ── Use pack-based columns — no grid, no scrollframe-in-grid ─────
+        # Each column is a plain Frame with fixed width packed side by side
+        # inside a horizontal scrollable canvas. This renders all at once.
+        import tkinter as _tk
+
+        outer = ctk.CTkFrame(self.pipeline_pane, fg_color="transparent")
+        outer.pack(fill="both", expand=True, padx=12, pady=(0,16))
+
+        # Horizontal scroll canvas
+        h_canvas = _tk.Canvas(outer, bg=LIGHT, highlightthickness=0)
+        h_scroll = ctk.CTkScrollbar(outer, orientation="horizontal",
+                                    command=h_canvas.xview)
+        h_scroll.pack(side="bottom", fill="x")
+        h_canvas.pack(side="left", fill="both", expand=True)
+        h_canvas.configure(xscrollcommand=h_scroll.set)
+
+        # Inner frame sits inside the canvas
+        inner = ctk.CTkFrame(h_canvas, fg_color="transparent")
+        h_canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        # Calculate column width reliably — winfo_width can return 1
+        # before layout completes so we fall back to window width - sidebar
+        MIN_COL_W = 220
+        self.update_idletasks()
+        raw_w = self.pipeline_pane.winfo_width()
+        if raw_w < 100:  # not laid out yet — use main window width
+            raw_w = self.winfo_width() - 200  # subtract sidebar width
+        avail_w = max(raw_w - 40, MIN_COL_W * len(PIPELINE_STAGES))
+        n_cols  = len(PIPELINE_STAGES)
+        COL_W   = max(MIN_COL_W, (avail_w // n_cols) - 8)
+
+        for col_idx, (stage_key, stage_label, text_col, bg_col) in enumerate(PIPELINE_STAGES):
+            col = ctk.CTkFrame(inner, fg_color="transparent", width=COL_W)
+            col.pack(side="left", anchor="n", padx=4, pady=2)
+            # Do NOT pack_propagate(False) — let height grow with content
+
+            # Column header
+            hdr_f = ctk.CTkFrame(col, fg_color=bg_col, corner_radius=8)
+            hdr_f.pack(fill="x", pady=(0,6))
+            stage_clients = stage_groups.get(stage_key, [])
+            count_txt = f"{stage_label}  ({len(stage_clients)})"
+            ctk.CTkLabel(hdr_f, text=count_txt,
+                         font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color=text_col).pack(pady=7, padx=8)
+
+            # Cards — packed directly, no scrollframe needed
+            body = ctk.CTkFrame(col, fg_color="transparent")
+            body.pack(fill="x")
+
+            if stage_clients:
+                for c in stage_clients:
+                    cid   = c['id']
+                    cname = c.get('company') or c.get('name', '')
+                    card  = ctk.CTkFrame(body, fg_color=WHITE,
+                                         corner_radius=8,
+                                         border_width=1, border_color=BORDER)
+                    card.pack(fill="x", pady=3, padx=2)
+
+                    label(card, cname, size=11, weight="bold",
+                          wraplength=COL_W-24, justify="left",
+                          anchor="w").pack(anchor="w", padx=8, pady=(6,2))
+
+                    if c.get('name') and c['name'].lower() != cname.lower():
+                        label(card, f"👤 {c['name']}", size=10, color=GRAY,
+                              wraplength=COL_W-24).pack(anchor="w", padx=8)
+
+                    if c.get('city'):
+                        local = is_local_client(c['city'])
+                        label(card,
+                              f"📍 {c['city']}{' · Local' if local else ''}",
+                              size=10,
+                              color=GREEN if local else GRAY).pack(anchor="w", padx=8)
+
+
+
+                    act = ctk.CTkFrame(card, fg_color="transparent")
+                    act.pack(fill="x", padx=6, pady=(2,6))
+
+                    btn(act, "CRM →",
+                        lambda i=cid: (self.pipeline_pane.pack_forget(),
+                                       self.crm_pane.pack(fill="both", expand=True),
+                                       self.open_crm_detail(i)),
+                        color=DARK, width=58).pack(side="left", padx=2)
+
+                    cur_idx = STAGE_KEYS.index(stage_key)
+                    # Back button — move to previous stage
+                    if cur_idx > 0:
+                        pk = STAGE_KEYS[cur_idx - 1]
+                        def _back(i=cid, ps=pk):
+                            if messagebox.askyesno("Move Back",
+                                f"Move this client back to '{STAGE_LABELS[ps]}'?"):
+                                set_client_pipeline_stage(i, ps)
+                                self._show_pipeline_view()
+                        btn(act, "← Back", _back,
+                            color="#6b7280", width=70).pack(side="left", padx=2)
+                    # Forward button — move to next stage
+                    next_idx = cur_idx + 1
+                    if next_idx < len(STAGE_KEYS):
+                        nk = STAGE_KEYS[next_idx]
+                        nl = STAGE_LABELS[nk]
+                        def _adv(i=cid, ns=nk):
+                            set_client_pipeline_stage(i, ns)
+                            self._show_pipeline_view()
+                        _short = nl[:8] + "…" if len(nl) > 8 else nl
+                        btn(act, f"→ {_short}", _adv,
+                            color=text_col, width=86).pack(side="left", padx=2)
+            else:
+                label(body, "None yet", size=11, color=GRAY).pack(pady=16)
+
+        # Update scroll region after all columns are built
+        # Update canvas scroll region
+        inner.update_idletasks()
+        h_canvas.configure(scrollregion=h_canvas.bbox("all") or (0,0,COL_W*n_cols+40,400))
+        # Hide scrollbar if everything fits
+        total_w = COL_W * n_cols + 40
+        if total_w <= avail_w:
+            h_scroll.pack_forget()
 
     def refresh_notes(self):
         for w in self.notes_scroll.winfo_children(): w.destroy()
@@ -2134,12 +2687,19 @@ class App(ctk.CTk):
         dlg.geometry("520x660")
         dlg.grab_set()
         dlg.configure(fg_color=WHITE)
+        self._set_icon(dlg)
 
         # ── Fixed footer — always visible, no scrolling needed ────────────
         footer = ctk.CTkFrame(dlg, fg_color=WHITE, border_width=1, border_color=BORDER)
         footer.pack(side="bottom", fill="x", padx=0, pady=0)
         save_status = label(footer, "", size=11, color=GREEN)
         save_status.pack(side="left", padx=16)
+
+        # ── Warning banner (hidden by default, shown on duplicate) ────────
+        warn_banner = ctk.CTkFrame(dlg, fg_color="#fffbeb",
+                                   border_width=1, border_color=AMBER,
+                                   corner_radius=0)
+        # Not packed yet — only shown when needed
 
         # ── Scrollable body ───────────────────────────────────────────────
         sf = scrollframe(dlg)
@@ -2173,6 +2733,12 @@ class App(ctk.CTk):
         last4_e = entry(sf, "Last 4 digits")
         last4_e.pack(fill="x", pady=(0,2))
         if c.get('payment_last4'): last4_e.insert(0, c['payment_last4'])
+        # Restrict to digits only, max 4 characters
+        def _validate_last4(P):
+            return P == "" or (P.isdigit() and len(P) <= 4)
+        _vcmd = sf.register(_validate_last4)
+        last4_e.configure(validate="key",
+                          validatecommand=(_vcmd, "%P"))
 
         label(sf, "Follow-up Date").pack(anchor="w", pady=(6,2))
         fup_e = entry(sf, "YYYY-MM-DD")
@@ -2205,16 +2771,8 @@ class App(ctk.CTk):
         ctk.CTkCheckBox(sf, text="⭐ Priority / Starred Client", variable=star_var,
                         fg_color=AMBER, hover_color=AMBER, text_color=DARK).pack(anchor="w", pady=(10,8))
 
-        def save():
-            name = fields['name'].get().strip()
-            if not name: messagebox.showwarning("Required","Contact name is required."); return
-            data = {k: e.get().strip() or None for k,e in fields.items()}
-            data['payment_method'] = pay_method.get()
-            data['payment_last4'] = last4_e.get().strip() or None
-            data['follow_up_date'] = fup_e.get().strip() or None
-            data['starred'] = star_var.get()
-            for k in ['ship_address','ship_city','ship_province','ship_postal']:
-                data[k] = fields.get(k, type('',(),{'get':lambda self,_=None:'','strip':lambda self:''})()).get().strip() or None
+        def _do_save(data):
+            """Actually write the client to the DB."""
             conn = get_db()
             if client_id:
                 conn.execute('''UPDATE clients SET name=?,company=?,address=?,city=?,province=?,postal=?,
@@ -2236,6 +2794,86 @@ class App(ctk.CTk):
             dlg.destroy()
             self.refresh_clients(); self.refresh_dashboard()
 
+        def save():
+            name = fields['name'].get().strip()
+            if not name: messagebox.showwarning("Required","Contact name is required."); return
+            data = {k: e.get().strip() or None for k,e in fields.items()}
+            data['payment_method'] = pay_method.get()
+            data['payment_last4'] = last4_e.get().strip() or None
+            data['follow_up_date'] = fup_e.get().strip() or None
+            data['starred'] = star_var.get()
+            for k in ['ship_address','ship_city','ship_province','ship_postal']:
+                data[k] = fields.get(k, type('',(),{'get':lambda self,_=None:'','strip':lambda self:''})()).get().strip() or None
+
+            # ── Duplicate detection (only for new clients, not edits) ──────
+            if not client_id:
+                conn = get_db()
+                dupes = []
+                # Check by company name (only if non-empty)
+                company_val = (data.get('company') or '').strip()
+                if company_val:
+                    hit = conn.execute(
+                        "SELECT id, name, company FROM clients WHERE LOWER(TRIM(company))=LOWER(TRIM(?))",
+                        (company_val,)
+                    ).fetchone()
+                    if hit:
+                        dupes.append(f'Company: "{hit["company"]}"')
+                # Check by email (only if non-empty)
+                email_val = (data.get('email') or '').strip()
+                if email_val:
+                    hit = conn.execute(
+                        "SELECT id, name, company, email FROM clients WHERE LOWER(TRIM(email))=LOWER(TRIM(?)) AND TRIM(email) != ''",
+                        (email_val,)
+                    ).fetchone()
+                    if hit:
+                        dupes.append(f"Email: {hit['email']} — already belongs to {hit['company'] or hit['name']}")
+                # Check by phone (only if non-empty)
+                phone_val = (data.get('phone') or '').strip()
+                if phone_val:
+                    clean_new = ''.join(filter(str.isdigit, phone_val))
+                    if clean_new:
+                        all_clients = conn.execute("SELECT id, name, company, phone FROM clients WHERE phone IS NOT NULL AND TRIM(phone) != ''").fetchall()
+                        for row in all_clients:
+                            clean_existing = ''.join(filter(str.isdigit, row['phone'] or ''))
+                            if clean_existing and clean_new == clean_existing:
+                                dupes.append(f"Phone: {row['phone']} — already belongs to {row['company'] or row['name']}")
+                                break
+                conn.close()
+
+                if dupes:
+                    # Show warning banner above the footer
+                    for w in warn_banner.winfo_children(): w.destroy()
+
+                    label(warn_banner, "⚠  Duplicate detected:",
+                          size=11, weight="bold",
+                          color="#b45309").pack(anchor="w", padx=12, pady=(8,2))
+                    for d in dupes:
+                        label(warn_banner, f"  • {d}",
+                              size=10, color="#92400e").pack(anchor="w", padx=16)
+
+                    btn_row = ctk.CTkFrame(warn_banner, fg_color="transparent")
+                    btn_row.pack(fill="x", padx=12, pady=(6,8))
+                    label(btn_row, "Add anyway?", size=11,
+                          color=DARK).pack(side="left", padx=(0,8))
+
+                    def _save_anyway():
+                        warn_banner.pack_forget()
+                        _do_save(data)
+
+                    def _cancel_dupe():
+                        warn_banner.pack_forget()
+
+                    btn(btn_row, "Yes, add anyway", _save_anyway,
+                        color=RED, width=140).pack(side="left", padx=(0,6))
+                    btn(btn_row, "No, go back", _cancel_dupe,
+                        color="#374151", width=110).pack(side="left")
+
+                    # Pack banner above footer
+                    warn_banner.pack(side="bottom", fill="x", before=footer)
+                    return  # wait for user choice
+
+            _do_save(data)
+
         # Save button lives in the fixed footer
         btn(footer, "💾  Save Client", save, color=RED, width=160).pack(side="right", padx=12, pady=10)
 
@@ -2247,6 +2885,444 @@ class App(ctk.CTk):
             conn.execute('DELETE FROM clients WHERE id=?', (client_id,))
             conn.commit(); conn.close()
             self.refresh_clients(); self.refresh_dashboard()
+
+
+    # ── FULFILMENT TRACKER ────────────────────────────────────────────────────
+    def _build_fulfilment(self):
+        p = self.pages["fulfilment"]
+        hdr = ctk.CTkFrame(p, fg_color="transparent")
+        hdr.pack(fill="x", padx=24, pady=(20,0))
+        label(hdr, "Fulfilment Tracker", size=22, weight="bold").pack(side="left")
+        btn(hdr, "+ New Fulfilment", self._open_fulfilment_dialog, color=RED, width=150).pack(side="right")
+        btn(hdr, "⚙ Carriers", self._open_carriers_dialog, color="#374151", width=110).pack(side="right", padx=(0,8))
+
+        # Filter bar
+        fbar = ctk.CTkFrame(p, fg_color="transparent")
+        fbar.pack(fill="x", padx=24, pady=(10,0))
+        self.ff_filter = ctk.CTkComboBox(fbar,
+            values=["All Orders","In Progress","Delivered","Overdue"],
+            width=140, fg_color=WHITE, border_color=BORDER, text_color=DARK,
+            command=lambda _: self.refresh_fulfilment())
+        self.ff_filter.set("All Orders")
+        self.ff_filter.pack(side="left")
+
+        # Stats bar
+        self.ff_stats = ctk.CTkFrame(p, fg_color="transparent")
+        self.ff_stats.pack(fill="x", padx=24, pady=(10,0))
+
+        # List
+        self.ff_list = scrollframe(p)
+        self.ff_list.pack(fill="both", expand=True, padx=24, pady=(8,16))
+
+    STAGES = [
+        ("ordered",   "Order Placed", "#16A34A"),
+        ("packed",    "Packing",      "#3b82f6"),
+        ("shipped",   "Shipped",      "#7c3aed"),
+        ("delivered", "Delivered",    "#16A34A"),
+    ]
+    STAGE_KEYS_FF  = ["ordered","packed","shipped","delivered"]
+    OVERDUE_DAYS   = {"ordered": None, "packed": 3, "shipped": 5, "delivered": None}
+    CARRIER_URLS   = {}  # populated from DB
+
+    def _get_carriers(self):
+        conn = get_db()
+        rows = conn.execute("SELECT name, tracking_url FROM carriers ORDER BY name").fetchall()
+        conn.close()
+        return {r["name"]: r["tracking_url"] for r in rows}
+
+    def _days_since(self, dt_str):
+        if not dt_str: return None
+        try:
+            from datetime import datetime as _dt
+            d = _dt.strptime(dt_str[:10], "%Y-%m-%d")
+            return (_dt.now() - d).days
+        except: return None
+
+    def _is_overdue(self, ff):
+        stage = ff.get("stage","ordered")
+        threshold = self.OVERDUE_DAYS.get(stage)
+        if threshold is None: return False
+        field = {"packed":"ordered_at","shipped":"packed_at"}.get(stage)
+        if not field: return False
+        days = self._days_since(ff.get(field,""))
+        return days is not None and days > threshold
+
+    def refresh_fulfilment(self):
+        filt = self.ff_filter.get() if hasattr(self,"ff_filter") else "All Orders"
+        conn = get_db()
+        rows = [dict(r) for r in conn.execute(
+            """SELECT f.*, i.invoice_number, c.company, c.name as cname
+               FROM fulfilment f
+               LEFT JOIN invoices i ON f.invoice_id=i.id
+               LEFT JOIN clients  c ON f.client_id=c.id
+               ORDER BY f.id DESC"""
+        ).fetchall()]
+        conn.close()
+
+        # Apply filter
+        if filt == "In Progress":
+            rows = [r for r in rows if r["stage"] != "delivered"]
+        elif filt == "Delivered":
+            rows = [r for r in rows if r["stage"] == "delivered"]
+        elif filt == "Overdue":
+            rows = [r for r in rows if self._is_overdue(r)]
+
+        # Stats
+        for w in self.ff_stats.winfo_children(): w.destroy()
+        all_rows_conn = get_db()
+        all_ff = [dict(r) for r in all_rows_conn.execute("SELECT * FROM fulfilment").fetchall()]
+        all_rows_conn.close()
+        total     = len(all_ff)
+        delivered = sum(1 for r in all_ff if r["stage"]=="delivered")
+        in_transit= sum(1 for r in all_ff if r["stage"]=="shipped")
+        overdue   = sum(1 for r in all_ff if self._is_overdue(r))
+        # Avg fulfilment days for delivered orders
+        times = []
+        for r in all_ff:
+            if r["stage"]=="delivered" and r.get("ordered_at") and r.get("delivered_at"):
+                d = self._days_since(r["ordered_at"])
+                if d: times.append(d)
+        avg = f"{sum(times)/len(times):.1f} days" if times else "—"
+        for lbl_t, val_t, col in [
+            ("Total Orders", str(total), DARK),
+            ("In Transit",   str(in_transit), BLUE),
+            ("Delivered",    str(delivered), GREEN),
+            ("Overdue",      str(overdue), RED),
+            ("Avg Fulfilment", avg, "#7c3aed"),
+        ]:
+            card = ctk.CTkFrame(self.ff_stats, fg_color=WHITE, corner_radius=8,
+                                border_width=1, border_color=BORDER)
+            card.pack(side="left", expand=True, fill="x", padx=4)
+            label(card, lbl_t, size=10, color=GRAY).pack(pady=(8,2), padx=10)
+            label(card, val_t, size=18, weight="bold", color=col).pack(pady=(0,8), padx=10)
+
+        # Render cards
+        for w in self.ff_list.winfo_children(): w.destroy()
+        if not rows:
+            label(self.ff_list, "No fulfilment records yet — create one with + New Fulfilment",
+                  color=GRAY).pack(pady=40)
+            return
+
+        carriers = self._get_carriers()
+        for ff in rows:
+            overdue = self._is_overdue(ff)
+            bg  = "#fffbeb" if overdue else WHITE
+            bdr = AMBER    if overdue else BORDER
+            card = ctk.CTkFrame(self.ff_list, fg_color=bg, corner_radius=10,
+                                border_width=1, border_color=bdr)
+            card.pack(fill="x", pady=5)
+            inner = ctk.CTkFrame(card, fg_color="transparent")
+            inner.pack(fill="x", padx=14, pady=(10,4))
+
+            # ── Colour-coded rectangular stage tracker ─────────────────────
+            # 25ABCs brand: dark navy / amber / red / green
+            # Each entry: (text_colour, background_colour, active_border)
+            _FF_COLS = {
+                "ordered":   ("#ffffff", "#1a1a2e", "#1a1a2e"),
+                "packed":    ("#92400e", "#fef3c7", "#d97706"),
+                "shipped":   ("#991b1b", "#fee2e2", "#E63B2E"),
+                "delivered": ("#166534", "#dcfce7", "#16A34A"),
+            }
+            stage_idx = self.STAGE_KEYS_FF.index(ff["stage"]) if ff["stage"] in self.STAGE_KEYS_FF else 0
+            bar_frame = ctk.CTkFrame(inner, fg_color="transparent")
+            bar_frame.pack(fill="x", pady=(0,8))
+            import tkinter as _tk2
+            for si, (sk, sl, sc) in enumerate(self.STAGES):
+                done   = si <= stage_idx
+                active = si == stage_idx
+                txt_col, bg_col, bdr_col = _FF_COLS.get(sk, ("#374151","#f3f4f6","#e5e7eb"))
+                if not done:
+                    bg_col  = "#f3f4f6"
+                    txt_col = "#9ca3af"
+                    bdr_col = "#e5e7eb"
+
+                # Outer container to hold the segment
+                seg_wrap = ctk.CTkFrame(bar_frame, fg_color="transparent")
+                seg_wrap.pack(side="left", expand=True, fill="x", padx=2)
+
+                if active:
+                    # Active stage — hatched canvas for clear visual progress
+                    seg_canvas = _tk2.Canvas(seg_wrap, height=34,
+                                            bg=bg_col, highlightthickness=1,
+                                            highlightbackground=bdr_col,
+                                            relief="flat")
+                    seg_canvas.pack(fill="x")
+                    # Draw diagonal hatch lines after widget is mapped
+                    def _draw_hatch(c=seg_canvas, bc=bg_col, lc=bdr_col, t=txt_col, label_txt=sl):
+                        c.update_idletasks()
+                        w = c.winfo_width()
+                        h = c.winfo_height()
+                        if w < 2: w = 100
+                        # Fill background
+                        c.create_rectangle(0, 0, w, h, fill=bc, outline="")
+                        # Diagonal hatch lines (45 degrees, every 6px)
+                        spacing = 6
+                        for x in range(-h, w + h, spacing):
+                            c.create_line(x, 0, x + h, h,
+                                         fill=lc, width=1)
+                        # Label on top
+                        c.create_text(w//2, h//2, text=label_txt,
+                                     font=("Segoe UI", 10, "bold"),
+                                     fill=t, anchor="center")
+                    seg_canvas.bind("<Map>", lambda e, fn=_draw_hatch: fn())
+                    seg_canvas.after(50, _draw_hatch)
+                else:
+                    # Non-active — plain coloured rectangle
+                    seg = ctk.CTkFrame(seg_wrap, fg_color=bg_col,
+                                       corner_radius=6,
+                                       border_width=1,
+                                       border_color=bdr_col)
+                    seg.pack(fill="x")
+                    ctk.CTkLabel(seg, text=sl,
+                                 font=ctk.CTkFont(size=10),
+                                 text_color=txt_col).pack(pady=6, padx=4)
+
+            # ── Invoice + client ──────────────────────────────────────────
+            inv_num = ff.get("invoice_number","—")
+            client  = ff.get("company") or ff.get("cname") or "—"
+            info_row = ctk.CTkFrame(inner, fg_color="transparent")
+            info_row.pack(fill="x", pady=(2,2))
+            label(info_row, f"{inv_num}  ·  {client}", size=13, weight="bold").pack(side="left")
+            if overdue:
+                label(info_row, "⚠ Overdue", size=10, color="#b45309", weight="bold").pack(side="left", padx=(12,0))
+
+            # ── Tracking row ──────────────────────────────────────────────
+            trk_row = ctk.CTkFrame(inner, fg_color="transparent")
+            trk_row.pack(fill="x", pady=(0,4))
+            carrier = ff.get("carrier","")
+            tracking = ff.get("tracking_number","")
+            days_in_stage = self._days_since(
+                ff.get({"ordered":"ordered_at","packed":"ordered_at",
+                        "shipped":"shipped_at","delivered":"shipped_at"}.get(ff["stage"],""))
+            )
+            stage_txt = f"{ff['stage'].title()}"
+            if days_in_stage is not None:
+                stage_txt += f"  ·  {days_in_stage}d in this stage"
+            label(trk_row, f"🚚 {carrier}  {stage_txt}", size=10, color=GRAY).pack(side="left")
+            if tracking and carrier in carriers:
+                url = carriers[carrier].replace("{tracking}", tracking)
+                btn(trk_row, "🔗 Track", lambda u=url: __import__("webbrowser").open(u),
+                    color="#374151", width=70).pack(side="left", padx=(10,0))
+
+            # ── Notes ─────────────────────────────────────────────────────
+            if ff.get("notes"):
+                label(inner, ff["notes"], size=10, color=GRAY).pack(anchor="w")
+
+            # ── Action buttons ────────────────────────────────────────────
+            act_row = ctk.CTkFrame(card, fg_color="transparent")
+            act_row.pack(fill="x", padx=14, pady=(0,8))
+            fid = ff["id"]
+            cur_idx = self.STAGE_KEYS_FF.index(ff["stage"]) if ff["stage"] in self.STAGE_KEYS_FF else 0
+            if cur_idx < len(self.STAGE_KEYS_FF)-1:
+                nk = self.STAGE_KEYS_FF[cur_idx+1]
+                nl = self.STAGES[cur_idx+1][1]
+                btn(act_row, f"→ Mark as {nl}",
+                    lambda i=fid, s=nk: self._advance_fulfilment(i, s),
+                    color=DARK, width=140).pack(side="left", padx=(0,6))
+            btn(act_row, "✏ Edit",
+                lambda i=fid: self._open_fulfilment_dialog(i),
+                color="#374151", width=70).pack(side="left", padx=(0,6))
+            btn(act_row, "✕",
+                lambda i=fid: self._delete_fulfilment(i),
+                color=RED, width=36).pack(side="left")
+
+    def _advance_fulfilment(self, fid, new_stage):
+        field_map = {
+            "packed":    "packed_at",
+            "shipped":   "shipped_at",
+            "delivered": "delivered_at",
+        }
+        field = field_map.get(new_stage)
+        conn = get_db()
+        if field:
+            conn.execute(f"UPDATE fulfilment SET stage=?, {field}=? WHERE id=?",
+                         (new_stage, today(), fid))
+        else:
+            conn.execute("UPDATE fulfilment SET stage=? WHERE id=?", (new_stage, fid))
+        conn.commit(); conn.close()
+        self.refresh_fulfilment()
+
+    def _delete_fulfilment(self, fid):
+        if messagebox.askyesno("Delete", "Delete this fulfilment record?"):
+            conn = get_db()
+            conn.execute("DELETE FROM fulfilment WHERE id=?", (fid,))
+            conn.commit(); conn.close()
+            self.refresh_fulfilment()
+
+    def _open_fulfilment_dialog(self, fid=None):
+        conn = get_db()
+        ff = dict(conn.execute("SELECT * FROM fulfilment WHERE id=?", (fid,)).fetchone()) if fid else {}
+        invoices = conn.execute(
+            "SELECT i.id, i.invoice_number, c.company, c.name as cname FROM invoices i "
+            "LEFT JOIN clients c ON i.client_id=c.id ORDER BY i.id DESC"
+        ).fetchall()
+        carriers = [r["name"] for r in conn.execute("SELECT name FROM carriers ORDER BY name").fetchall()]
+        conn.close()
+
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Edit Fulfilment" if fid else "New Fulfilment")
+        dlg.geometry("460x520")
+        dlg.grab_set()
+        dlg.configure(fg_color=WHITE)
+
+        footer = ctk.CTkFrame(dlg, fg_color=WHITE, border_width=1, border_color=BORDER)
+        footer.pack(side="bottom", fill="x")
+        sf = scrollframe(dlg)
+        sf.pack(fill="both", expand=True, padx=20, pady=12)
+
+        # Invoice picker
+        label(sf, "Invoice").pack(anchor="w", pady=(4,2))
+        inv_opts = ["— No Invoice —"] + [
+            f"{r['invoice_number']} · {r['company'] or r['cname'] or ''}" for r in invoices
+        ]
+        inv_ids = [None] + [r["id"] for r in invoices]
+        inv_combo = ctk.CTkComboBox(sf, values=inv_opts, fg_color=WHITE,
+                                    border_color=BORDER, text_color=DARK)
+        inv_combo.pack(fill="x", pady=(0,6))
+        if ff.get("invoice_id"):
+            for idx, iid in enumerate(inv_ids):
+                if iid == ff["invoice_id"]:
+                    inv_combo.set(inv_opts[idx]); break
+        else:
+            inv_combo.set(inv_opts[0])
+
+        # Carrier + tracking
+        label(sf, "Carrier").pack(anchor="w", pady=(4,2))
+        carrier_combo = ctk.CTkComboBox(sf, values=carriers, fg_color=WHITE,
+                                        border_color=BORDER, text_color=DARK)
+        carrier_combo.set(ff.get("carrier", carriers[0] if carriers else "Canada Post"))
+        carrier_combo.pack(fill="x", pady=(0,6))
+
+        label(sf, "Tracking Number (optional)").pack(anchor="w", pady=(4,2))
+        trk_e = entry(sf, "e.g. 1234567890")
+        trk_e.pack(fill="x", pady=(0,6))
+        if ff.get("tracking_number"): trk_e.insert(0, ff["tracking_number"])
+
+        # Stage
+        label(sf, "Current Stage").pack(anchor="w", pady=(4,2))
+        stage_combo = ctk.CTkComboBox(sf,
+            values=[s[1] for s in self.STAGES],
+            fg_color=WHITE, border_color=BORDER, text_color=DARK)
+        cur_stage = ff.get("stage","ordered")
+        stage_combo.set(next((s[1] for s in self.STAGES if s[0]==cur_stage), "Order Placed"))
+        stage_combo.pack(fill="x", pady=(0,6))
+
+        # Notes
+        label(sf, "Notes (optional)").pack(anchor="w", pady=(4,2))
+        notes_box = ctk.CTkTextbox(sf, height=70, fg_color=WHITE,
+                                   border_color=BORDER, text_color=DARK, border_width=1)
+        notes_box.pack(fill="x", pady=(0,6))
+        if ff.get("notes"): notes_box.insert("1.0", ff["notes"])
+
+        def save():
+            sel_stage = next((s[0] for s in self.STAGES if s[1]==stage_combo.get()), "ordered")
+            inv_idx = inv_opts.index(inv_combo.get())
+            sel_inv_id = inv_ids[inv_idx]
+            # Derive client_id from invoice
+            sel_client_id = None
+            if sel_inv_id:
+                c2 = get_db()
+                inv_row = c2.execute("SELECT client_id FROM invoices WHERE id=?", (sel_inv_id,)).fetchone()
+                c2.close()
+                if inv_row: sel_client_id = inv_row["client_id"]
+            # Auto-set timestamps for stages
+            now = today()
+            conn2 = get_db()
+            if fid:
+                conn2.execute(
+                    "UPDATE fulfilment SET invoice_id=?,client_id=?,carrier=?,tracking_number=?,"
+                    "stage=?,notes=? WHERE id=?",
+                    (sel_inv_id, sel_client_id, carrier_combo.get(),
+                     trk_e.get().strip() or None,
+                     sel_stage, notes_box.get("1.0","end").strip() or None, fid)
+                )
+            else:
+                conn2.execute(
+                    "INSERT INTO fulfilment (invoice_id,client_id,carrier,tracking_number,"
+                    "stage,ordered_at,packed_at,shipped_at,delivered_at,notes) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (sel_inv_id, sel_client_id, carrier_combo.get(),
+                     trk_e.get().strip() or None, sel_stage,
+                     now,
+                     now if sel_stage in ("packed","shipped","delivered") else None,
+                     now if sel_stage in ("shipped","delivered") else None,
+                     now if sel_stage == "delivered" else None,
+                     notes_box.get("1.0","end").strip() or None)
+                )
+            conn2.commit(); conn2.close()
+            dlg.destroy()
+            self.refresh_fulfilment()
+
+        btn(footer, "💾 Save", save, color=RED, width=140).pack(side="right", padx=12, pady=10)
+        btn(footer, "Cancel", dlg.destroy, color=GRAY, width=90).pack(side="right", pady=10)
+
+    def _open_carriers_dialog(self):
+        """Manage carriers — add/remove custom carriers."""
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Manage Carriers")
+        dlg.geometry("480x480")
+        dlg.grab_set()
+        dlg.configure(fg_color=WHITE)
+
+        label_hdr = ctk.CTkFrame(dlg, fg_color="transparent")
+        label_hdr.pack(fill="x", padx=20, pady=(16,8))
+        label(label_hdr, "Carriers", size=16, weight="bold").pack(side="left")
+
+        sf = scrollframe(dlg)
+        sf.pack(fill="both", expand=True, padx=20, pady=(0,8))
+
+        def refresh_carrier_list():
+            for w in sf.winfo_children(): w.destroy()
+            conn = get_db()
+            carriers = conn.execute("SELECT * FROM carriers ORDER BY name").fetchall()
+            conn.close()
+            for car in carriers:
+                row = ctk.CTkFrame(sf, fg_color=LIGHT, corner_radius=6)
+                row.pack(fill="x", pady=2)
+                inner = ctk.CTkFrame(row, fg_color="transparent")
+                inner.pack(fill="x", padx=10, pady=6)
+                label(inner, car["name"], size=12, weight="bold").pack(side="left")
+                label(inner, car["tracking_url"][:40]+"…" if len(car["tracking_url"])>40
+                      else car["tracking_url"], size=9, color=GRAY).pack(side="left", padx=8)
+                def _del(cid=car["id"]):
+                    conn2 = get_db()
+                    conn2.execute("DELETE FROM carriers WHERE id=?", (cid,))
+                    conn2.commit(); conn2.close()
+                    refresh_carrier_list()
+                btn(inner, "✕", _del, color=RED, width=28).pack(side="right")
+
+        refresh_carrier_list()
+
+        # Add new carrier
+        separator(dlg).pack(fill="x", padx=20, pady=4)
+        add_frame = ctk.CTkFrame(dlg, fg_color="transparent")
+        add_frame.pack(fill="x", padx=20, pady=(0,12))
+        label(add_frame, "Add Carrier", size=13, weight="bold").pack(anchor="w", pady=(0,6))
+        name_e = entry(add_frame, "Carrier name (e.g. USPS)")
+        name_e.pack(fill="x", pady=(0,4))
+        url_e = entry(add_frame, "Tracking URL with {tracking} placeholder")
+        url_e.pack(fill="x", pady=(0,6))
+        label(add_frame, "e.g. https://tools.usps.com/go/TrackConfirmAction?tLabels={tracking}",
+              size=9, color=GRAY).pack(anchor="w")
+
+        def add_carrier():
+            name = name_e.get().strip()
+            url  = url_e.get().strip()
+            if not name or not url:
+                messagebox.showwarning("Required", "Name and URL are both required."); return
+            if "{tracking}" not in url:
+                messagebox.showwarning("Invalid URL", "URL must contain {tracking} placeholder."); return
+            conn = get_db()
+            try:
+                conn.execute("INSERT INTO carriers (name, tracking_url) VALUES (?,?)", (name, url))
+                conn.commit()
+            except:
+                messagebox.showwarning("Duplicate", f"{name} already exists.")
+            conn.close()
+            name_e.delete(0,"end"); url_e.delete(0,"end")
+            refresh_carrier_list()
+
+        btn(add_frame, "+ Add Carrier", add_carrier, color=RED, width=130).pack(anchor="w", pady=(8,0))
 
     # ── SETTINGS ─────────────────────────────────────────────────────────
     def _build_settings(self):
@@ -2364,8 +3440,8 @@ class App(ctk.CTk):
         self.settings_status.configure(text="✓  Settings saved successfully!")
         self.after(3000, lambda: self.settings_status.configure(text=""))
         # Update window title with business name
-        biz = get_settings().get("biz_name","InvoBiz25")
-        self.title(f"{biz} — InvoBiz25")
+        biz = get_settings().get("biz_name","InvoBiz")
+        self.title(f"{biz} — InvoBiz")
 
 if __name__ == "__main__":
     app = App()
